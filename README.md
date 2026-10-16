@@ -54,6 +54,20 @@ git clone https://github.com/weisun23/autoxjs-scripts.git
 
 ---
 
+## 开发与验证
+
+改脚本之前建议先跑本地验证——**不需要手机、不需要无障碍服务**：
+
+```bash
+node tools/selftest.js                   # 跑脚本内置自检（纯函数断言）
+node tools/selftest.js --sim-no-entry    # 场景回归：模拟额度领完、入口消失
+```
+
+原理是给 AutoX.js 的全局 API 打桩，然后直接 `eval` 脚本。因为自检分支不碰界面，
+纯函数逻辑能在电脑上完整验证。改完状态机先跑这个，再去真机验证。
+
+---
+
 ## 收录标准
 
 这个仓库不收「看起来能用」的脚本。收录前至少满足：

@@ -30,7 +30,8 @@ var LOCAL_ENV = {
     maxAdWaitSec: '',       // 单条广告最长等待（秒），默认 90，范围 20-300
     maxRunMinutes: '',      // 总运行时长上限（分钟），默认 60，范围 1-480
     maxAdCount: '',         // 最多观看广告条数，默认 30，范围 1-200
-    selftest: ''            // 填 '1' 只跑内置自检，不操作界面
+    selftest: '',           // 填 '1' 只跑内置自检，不操作界面
+    entryMissGiveUp: ''     // 连续几次导航找不到入口就判定额度领完并退出，默认 2，范围 1-20
 };
 
 // -------------------- 1. 配置 --------------------
@@ -105,6 +106,12 @@ var CONFIG = {
     appLaunchWaitMs: 6000,   // launchApp 后等待界面稳定的时间
     navRetryLimit: 3,        // 「我的」页签导航重试次数
     scrollRoundsToFind: 3,   // 找任务入口时最多向上滚动几次
+
+    // --- 任务入口消失（额度领完）---
+    // 入口消失时，UNKNOWN 的恢复逻辑会 back() → 重启 App 无限找入口。
+    // 这两个参数给「确认入口确实没了」提供出口。
+    noEntryGraceRounds: 5,   // 在汽水音乐里看不到入口时，先宽容几轮（广告页起来有延迟）
+    entryMissGiveUp: readInt('entryMissGiveUp', 2, 1, 20),   // 连续几次完整导航仍找不到入口，判定入口已消失
 
     // --- 广告顶栏 ---
     // 顶栏按钮的 bounds 高度会塌缩成 0（实测 [619,91,1036,91]），
@@ -378,6 +385,7 @@ var STATE = {
     LIVE_PAGE: 'LIVE_PAGE',                 // 误入直播页
     AD_PLAYING: 'AD_PLAYING',               // 广告播放中
     TASK_ENTRY: 'TASK_ENTRY',               // 「我的」页面的任务入口
+    NO_ENTRY: 'NO_ENTRY',                   // 在汽水音乐里，但看不到任务入口（可能额度已领完）
     OFF_TRACK: 'OFF_TRACK',                 // 跑偏到别的 App
     UNKNOWN: 'UNKNOWN'                      // 无法识别
 };
@@ -422,6 +430,15 @@ function detectState(ctx) {
         return STATE.OFF_TRACK;
     }
 
+    // 确认在汽水音乐里，但既没有任务入口、也不在广告页/弹窗上。
+    //
+    // 单独成一类而不是丢给 UNKNOWN：额度领完后入口会消失，
+    // 若走 UNKNOWN 的恢复逻辑，就会 back() → 重启 App → 再找 → 再 back()
+    // 无限循环（unknownRecoveries 在 else 分支里被清零，永远升不到下一级）。
+    if (APP_PKG && ctx.pkgName === APP_PKG) {
+        return STATE.NO_ENTRY;
+    }
+
     return STATE.UNKNOWN;
 }
 
@@ -452,7 +469,10 @@ var RUNTIME = {
     offTrackCount: 0,           // 累计「独立跑偏事件」次数，超限认输退出（用户在手动干预）
     offTrackEpisodeCounted: false,  // 当前这次连续跑偏是否已计数，防止一次操作被重复累加
     lastCountdownSec: null,     // 上一次记录的倒计时秒数，仅用于避免日志刷屏
-    sheetCloseAttempts: 0       // 成长弹窗关闭尝试次数，用于逐级换坐标
+    sheetCloseAttempts: 0,      // 成长弹窗关闭尝试次数，用于逐级换坐标
+    noEntryRounds: 0,           // 连续处于「看不到入口」状态的轮数
+    entryMissCount: 0,          // 连续多少次完整导航都没找到入口
+    endReason: null             // 由状态机指定结束原因，优先于入口段的默认值
 };
 
 RUNTIME.expectAdSec = CONFIG.adDurationSec;
@@ -614,6 +634,21 @@ function handleState(state, ctx) {
             trackAction('关闭成长弹窗');
             break;
 
+        case STATE.NO_ENTRY:
+            RUNTIME.noEntryRounds++;
+
+            // 宽限期：刚点完「继续领」到广告页真正起来之间，会有几轮
+            // 既不在广告页、也看不到入口。这时候动手会把广告打断。
+            if (RUNTIME.noEntryRounds <= CONFIG.noEntryGraceRounds) {
+                trackAction('等入口出现');
+                break;
+            }
+
+            // 宽限过后仍找不到，走一次完整导航（拉前台 → 点我的 → 滚动找）
+            ensureAtTaskEntry();
+            trackAction('找任务入口');
+            break;
+
         case STATE.LIVE_PAGE:
             logWarn('误入直播页，返回');
             back();
@@ -726,6 +761,18 @@ function recoverStuckAd(ctx) {
     }
     RUNTIME.adStateEnteredAt = null;
     RUNTIME.adTimeoutStrikes = 0;
+}
+
+/**
+ * 「任务入口连续找不到」的计数与认输判定。纯函数，便于自检。
+ *
+ * 为什么要单独计数：入口消失后，ensureAtTaskEntry() 每次都要
+ * 「拉前台 → 点我的 → 逐屏滚动」走一遍完整流程，一次十几秒。
+ * 靠它连续失败来判断「入口确实没了」，比按轮询次数数更贴合真实成本。
+ */
+function entryMissStep(missCount, limit) {
+    var n = missCount + 1;
+    return { missCount: n, giveUp: n >= limit };
 }
 
 /**
@@ -948,6 +995,7 @@ function ensureAtTaskEntry() {
     // 后者会滚动，而启动时大概率停在播放页，盲滚既没用又浪费十几秒。
     if (findAny(SEL.任务卡片, 0)) {
         logInfo('任务入口已在屏幕上，无需导航');
+        RUNTIME.entryMissCount = 0;
         return true;
     }
 
@@ -968,12 +1016,26 @@ function ensureAtTaskEntry() {
         entry = findTaskEntry();
         if (entry) {
             logInfo('导航成功，已定位任务入口');
+            RUNTIME.entryMissCount = 0;
             return true;
         }
         logWarn('第 ' + (i + 1) + '/' + CONFIG.navRetryLimit + ' 次导航未找到任务入口');
     }
 
-    logWarn('导航失败，交给主循环的未知状态恢复处理');
+    // 走完一整轮「拉前台 → 点我的 → 滚动找」都没命中，记一次失败
+    var step = entryMissStep(RUNTIME.entryMissCount, CONFIG.entryMissGiveUp);
+    RUNTIME.entryMissCount = step.missCount;
+
+    if (step.giveUp) {
+        logWarn('连续 ' + step.missCount + ' 次完整导航都找不到任务入口');
+        logInfo('判定「继续领」入口已消失——通常是已达每日次数或总额度上限');
+        logInfo('这是正常结束，不再继续寻找入口');
+        RUNTIME.endReason = '任务入口已消失（额度领完）';
+        RUNTIME.exitLoop = true;
+    } else {
+        logWarn('第 ' + step.missCount + '/' + CONFIG.entryMissGiveUp
+            + ' 次完整导航未找到任务入口，稍后再试一次');
+    }
     return false;
 }
 
@@ -1028,6 +1090,10 @@ function mainLoop() {
             // 离开成长弹窗就重置关闭计数，下次弹出来重新从首选坐标开始
             if (state !== STATE.SHEET_DIALOG) {
                 RUNTIME.sheetCloseAttempts = 0;
+            }
+            // 同理：重新看到入口后，「看不到入口」的轮数清零
+            if (state !== STATE.NO_ENTRY) {
+                RUNTIME.noEntryRounds = 0;
             }
 
             handleState(state, ctx);
@@ -1195,6 +1261,16 @@ function runSelfTest() {
     APP_PKG = null;
     assertEq(detectState({ pkgName: 'com.android.chrome', inAdActivity: false }),
         STATE.UNKNOWN, '包名未知时不判跑偏');
+
+    // 额度领完后任务入口会消失。此时必须判为 NO_ENTRY 而不是 UNKNOWN，
+    // 否则会落进 UNKNOWN 的恢复逻辑，无限 back() + 重启 App 找入口。
+    APP_PKG = 'com.example.qishui';
+    assertEq(detectState({ pkgName: 'com.example.qishui', inAdActivity: false }),
+        STATE.NO_ENTRY, '在汽水音乐里看不到入口时判为 NO_ENTRY');
+    assertEq(detectState({ pkgName: 'com.example.qishui', inAdActivity: true }),
+        STATE.AD_PLAYING, '广告页优先于 NO_ENTRY');
+    assertEq(detectState({ pkgName: 'com.other.app', inAdActivity: false }),
+        STATE.OFF_TRACK, '别的 App 优先于 NO_ENTRY');
     APP_PKG = savedPkg;
 
     existsAny = realExistsAny;    // 必须恢复，否则后续逻辑继续走 stub
@@ -1248,6 +1324,23 @@ function runSelfTest() {
     assertEq((otLimit - 1) >= otLimit, false, '差一次仍会尝试恢复（' + (otLimit - 1) + '/' + otLimit + '）');
     assertEq(otLimit >= otLimit, true, '达到阈值即判定用户主动退出（' + otLimit + '/' + otLimit + '）');
 
+    log('[任务入口消失判定]');
+    // 入口消失时靠「完整导航连续失败」判断，边界错一就会永远找不到出口
+    var emLimit = CONFIG.entryMissGiveUp;
+    var em1 = entryMissStep(0, emLimit);
+    assertEq(em1.missCount, 1, '第 1 次导航失败计 1 次');
+    assertEq(em1.giveUp, (1 >= emLimit), '第 1 次是否认输取决于阈值');
+    if (emLimit >= 2) {
+        var em2 = entryMissStep(em1.missCount, emLimit);
+        assertEq(em2.missCount, 2, '第 2 次导航失败累加到 2 次');
+        assertEq(em2.giveUp, true, '达到阈值即判定入口消失并退出');
+    }
+    var em3 = entryMissStep(0, emLimit);    // 导航成功时会被清零，下次重新从 1 开始
+    assertEq(em3.missCount, 1, '清零后重新计数从 1 开始');
+    assertEq(entryMissStep(emLimit - 1, emLimit).giveUp, true, '恰好达到阈值即触发');
+    assertEq(entryMissStep(Math.max(emLimit - 2, 0), emLimit).giveUp,
+        (Math.max(emLimit - 2, 0) + 1 >= emLimit), '未达阈值不触发');
+
     log('[跑偏计数规则]');
     // 关键回归点：同一次连续跑偏在后续轮次里不得重复计数
     var st1 = offTrackStep(0, false);
@@ -1299,6 +1392,7 @@ if (SELFTEST) {
         ensureAtTaskEntry();
         mainLoop();
         if (RUNTIME.finishing) endReason = '达到配置上限';
+        if (RUNTIME.endReason) endReason = RUNTIME.endReason;   // 状态机指定的原因优先
     } catch (e) {
         endReason = '异常终止：' + e;
         logWarn('主循环抛出异常：' + e);
