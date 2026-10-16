@@ -1,0 +1,11 @@
+# 统一用 LF。脚本是按 LF 在真机上测过的，
+# 被 Windows 转成 CRLF 虽然 AutoX.js 也能跑，但会让 diff 噪音很大。
+* text=auto eol=lf
+
+# 二进制
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.apk binary
+*.zip binary
